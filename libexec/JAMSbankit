@@ -95,6 +95,53 @@ getScriptPath <- function() {
     }
 }
 
+#Define useful functions
+is.redundant <- function(vec){
+    propunique <- length(unique(vec))/length(vec)
+    if (propunique < 1){
+        redundant = TRUE
+    } else {
+        redundant = FALSE
+    }
+
+    return(redundant)
+}
+
+report2log <- function(message = NULL, opt = NULL, warn = FALSE){
+    #Disclaimer: not efficient, but works.
+    banker <- paste("Banker:", opt$user)
+    if (opt$simulate == FALSE){
+        logfile <- opt$logfile
+        if (warn == FALSE){
+            cat(paste(banker, flog.info(message), sep="->"), append = TRUE, file = opt$logfile)
+        } else {
+            cat(paste(banker, flog.warn(message), sep="->"), append = TRUE, file = opt$logfile)
+        }
+    } else {
+        if (warn == FALSE){
+            flog.info(message)
+        } else {
+            flog.warn(message)
+        }
+    }
+}
+
+test_writeability <- function(dirpath){
+    touchfile <- file.path(dirpath, "writetestJAMS")
+    testresult <- suppressWarnings(system2('touch', args = touchfile, stderr = TRUE, stdout = FALSE))
+    if (file.exists(touchfile)){
+        dmp <- file.remove(touchfile)
+    }
+
+    if (length(testresult) > 0){
+        writeability <- FALSE
+    } else {
+        writeability <- TRUE
+    }
+
+    return(writeability)
+}
+
 #########################
 # Get options from args #
 #########################
@@ -124,6 +171,9 @@ option_list <- list(
 
     make_option(c("-m", "--move"), default = defopt$move, action="store_true",
                 help = str_c("Copy to destination rather than move. Default is to move.")),
+
+    make_option(c("-m", "--chmod"), default = NULL, action="store",
+                help = str_c("Change permissions of banked files to this. Example: 755 or ug+rwx")),
 
     make_option(c("-x", "--deleteJAMSfolder"), default = FALSE,
                 action="store_true", help = str_c("Delete the JAMSalpha folder (Sample_JAMS) for that prefix at the origin.")),
@@ -178,138 +228,65 @@ if (is.null(opt$destination)) {
     q()
 }
 
-
-#Define useful functions
-is.redundant <- function(vec){
-    propunique <- length(unique(vec))/length(vec)
-    if (propunique < 1){
-        redundant = TRUE
-    } else {
-        redundant = FALSE
-    }
-
-    return(redundant)
-}
-
-find_container <- function(x) {
-    prefsuff <- unlist(strsplit(rawfastqsdf$Filenames[x], split = "\\."))
-    container <- paste(prefsuff[(which(prefsuff == "fastq")):(length(prefsuff))], collapse = ".")
-
-    return(container)
-}
-
 ###################
 ## Main Function ##
 ###################
 
 if (!(file.exists(opt$destination))){
-    flog.info("Creating directory to bank JAMSalpha files.")
+    flog.info("Creating folder to bank JAMSalpha files.")
     dir.create(opt$destination, recursive = TRUE)
-}
-save.image()
-q()
-
-#setwd(opt$destination)
-#opt$projimage <- file.path(opt$destination, ".RData")
-#save.image(opt$projimage)
-
-#Find fastq files at the origin
-rawfastqpaths <- list.files(path = opt$readsfolder, pattern = "fastq", full.names = TRUE, recursive = TRUE)
-rawfastqnames <- sapply(1:length(rawfastqpaths), function(x) { tail(unlist(strsplit(rawfastqpaths[x], split = "/")), n = 1) })
-datasetids <- sapply(1:length(rawfastqpaths), function(x) { tail(unlist(strsplit(rawfastqpaths[x], split = "/")), n = 2)[1] })
-
-#Make a dataframe with all the info
-rawfastqsdf <- data.frame(Filenames = rawfastqnames, Filepaths = rawfastqpaths, DatasetIDs = datasetids, stringsAsFactors = FALSE)
-
-#Find out read F and R
-if (opt$basespaceformat == TRUE){
-    rawfastqsdf$Read <- sapply(1:nrow(rawfastqsdf), function(x) { tail(unlist(strsplit(rawfastqsdf$Filenames[x], split = "_")), n = 2)[1] } )
-    rawfastqsdf$OriPrefix <- sapply(1:nrow(rawfastqsdf), function(x) { paste(unlist(strsplit(rawfastqsdf$Filenames[x], split = "_"))[1:((which(unlist(strsplit(rawfastqsdf$Filenames[x], split = "_")) == tail(unlist(strsplit(rawfastqsdf$Filenames[x], split = "_")), n = 4)[1])) - 1)], collapse = "_") } )
 } else {
-    flog.info("Still working on other input formats. Check for future versions.")
-    q()
+    flog.info("Found destination folder for banking JAMSalpha files.")
 }
 
-save.image(opt$projimage)
+#Assess if a banked directory structure already exists
+opt$jamsfiles <- file.path(opt$destination, "jamsfiles")
+opt$JAMStarballs <- file.path(opt$destination, "JAMStarballs")
+opt$reads <- file.path(opt$destination, "reads")
+opt$reports <- file.path(opt$destination, "reports")
+opt$logfile <- file.path(opt$destination, "bankit_log.txt")
+opt$user <- as.character(Sys.info()["user"])
 
-#Load substitution map
-#Adjust prefix if there is a substitution map
-if (!(is.null(opt$substitutionmap))){
-    submap <- read.table(opt$substitutionmap, header = FALSE, sep = "\t", stringsAsFactors = FALSE)
-    colnames(submap) <- c("OriPrefix", "Prefix")
-} else if(!(is.null(opt$substitutionspreadsheet))){
-    submap <- read.xlsx(opt$substitutionspreadsheet)
-    colnames(submap) <- c("OriPrefix", "Prefix")
-} else {
-    flog.info("If you want to rename samples, you must provide a substitution map. Aborting now.")
-    q()
-}
-
-#Test for redundancy in substitution map.
-redtestsubmap <- apply(submap, is.redundant, MARGIN=2)
-if (any(redtestsubmap)){
-    flog.warn(paste("Values in substitution table column(s)" , paste0(names(which(redtestsubmap == TRUE)), collapse = " and "), "are not unique. Check table and try again. Aborting now"))
-    q()
-}
-
-rawfastqsdf <- subset(rawfastqsdf, OriPrefix %in% (submap$OriPrefix))
-
-if (nrow(rawfastqsdf) < 1){
-    flog.info("No fastq files bearing the original prefixes in the substitution table provided were found. Aborting now.")
-    q()
-}
-
-#Tack on the new prefixes
-rawfastqsdf <- left_join(rawfastqsdf, submap, by = "OriPrefix")
-#Tack on the destinations
-rawfastqsdf$Container <- sapply(1:nrow(rawfastqsdf), function (x) { find_container(x) } )
-rawfastqsdf$NewFN <- paste(paste(rawfastqsdf$Prefix, rawfastqsdf$Read, sep = "_"), rawfastqsdf$Container, sep = ".")
-
-
-#Check if they are duplicates
-rawfastqsdfR1 <- subset(rawfastqsdf, Read == "R1")
-if (is.redundant(rawfastqsdfR1$OriPrefix)){
-    flog.warn("There is more than one input fastq file with the same prefix. Check input reads folder substitution table and try again. Aborting now.")
-    dupes <- rawfastqsdfR1$OriPrefix[duplicated(rawfastqsdfR1$OriPrefix)]
-    flog.warn(paste("The following original prefixes found in the reads folder are duplicated:", paste0(dupes, collapse = ", ")))
-    dupefns <- rawfastqsdf$Filepaths[which(rawfastqsdf$OriPrefix %in% dupes)]
-    flog.warn(paste("The following input filenames have the same prefix:\n", paste0(dupefns, collapse = "\n")))
-    q()
-}
-
-if (is.redundant(rawfastqsdfR1$Prefix)){
-    flog.warn("There is more than one output fastq file with the same prefix. Check input reads folder substitution table and try again. Aborting now.")
-    dupes <- rawfastqsdfR1$Prefix[duplicated(rawfastqsdfR1$Prefix)]
-    flog.warn(paste("The following new prefixes are duplicated:", paste0(dupes, collapse = ", ")))
-    dupefns <- rawfastqsdf$NewFN[which(rawfastqsdf$Prefix %in% dupes)]
-    flog.warn(paste("The following proposed output filenames are identical:", paste0(dupefns, collapse = ", ")))
-    q()
-}
-
-#Check if new prefix has already been used.
-if (!is.null(opt$checkprefixexists)){
-    flog.info(paste("Checking if new prefixes proposed in substitution table coincide with prefixes found in:", as.character(opt$checkprefixexists)))
-    jamsfns <- list.files(path = opt$checkprefixexists, pattern=".jams$")
-    usedprefixes <- sapply(1:length(jamsfns), function(x) { unlist(strsplit(jamsfns[x], split="\\."))[1] } )
-}
-
-prefixestouse <- unique(rawfastqsdf$Prefix)
-if (!is.null(opt$checkprefixexists)){
-    if (length(usedprefixes) > 0){
-        alreadyusedprexixes <- prefixestouse[(prefixestouse %in% usedprefixes)]
-        if (length(alreadyusedprexixes) > 0){
-            flog.warn(paste("WARNING: THE FOLLOWING PREFIXES HAVE BEEN FOUND IN", as.character(opt$checkprefixexists)))
-            flog.warn(paste0(alreadyusedprexixes, collapse = ", "))
-            flog.warn("Check your filenames and substitution table. ABORTING NOW.")
+JAMSsubfolders <- c("jamsfiles", "JAMStarballs", "reads", "reports")
+for (subfolder in JAMSsubfolders){
+    if (file.exists(opt[[subfolder]])){
+        flog.info(paste("Found", subfolder, "folder"))
+        if(!test_writeability(opt[[subfolder]])) {
+            flog.info(paste0("You have no writing permissions to ", opt[[subfolder]], ". Aborting now."))
             q()
-        } else {
-            flog.info("None of the proposed new prefixes have been used previously")
         }
+    } else {
+        flog.info(paste("Creating", subfolder, "folder"))
+        dir.create(opt[[subfolder]])
     }
 }
-save.image(opt$projimage)
 
-rawfastqsdf$NewFullFN <- file.path(opt$destination, rawfastqsdf$NewFN)
+## Find out what is available at the origin
+tarballs <- list.files(path = opt$origin, pattern = "_JAMS\\.tar\\.gz", full.names = FALSE, recursive = FALSE)
+prefixes <- sapply(1:length(tarballs), function(x) { unlist(strsplit(tarballs[x], split = "_"))[1] } )
+
+JAMSalphaorigindf <- data.frame(Prefix = prefixes, JAMStarball = tarballs, stringsAsFactors = FALSE)
+JAMSalphaorigindf$Report <- paste(JAMSalphaorigindf$Prefix, "JAMSalpha_report.pdf", sep = "_")
+JAMSalphaorigindf$JAMSfile <- paste(JAMSalphaorigindf$Prefix, "jams", sep = ".")
+#Load prefix list if present
+if (!(is.null(opt$prefixlist))){
+    wantedprefixes <- read.table(opt$prefixlist, header = FALSE, sep = " ", stringsAsFactors = FALSE)
+    wantedprefixes <- as.character(wantedprefixes[, 1])
+    if (!(all(wantedprefixes %in% JAMSalphaorigindf$Prefix))){
+        cat("WARNING: Not all JAMSalpha sample prefixes were found.\nUnable to find files for the following prefixes:\n")
+        cat(paste(paste0(wantedprefixes[!(wantedprefixes %in% JAMSalphaorigindf$Prefix)], collapse = ", "), "\n"))
+    }
+
+    JAMSalphaorigindf <- subset(JAMSalphaorigindf, Prefix %in% wantedprefixes)
+}
+
+if (nrow(JAMSalphaorigindf) < 1){
+    flog.info("No JAMSalpha sample prefixes were found. Aborting now.")
+    q()
+} else {
+    #start logging
+    report2log(message = paste("Banking JAMSalpha runs of samples with the following prefixes:", paste0(JAMSalphaorigindf$Prefix, collapse = ", ")), opt = opt)
+}
 
 #Copy or move the files
 if (opt$move == TRUE){
@@ -318,16 +295,71 @@ if (opt$move == TRUE){
     manipcmd <- "cp"
 }
 
-rencommands <- sapply(1:nrow(rawfastqsdf), function(x) { paste(manipcmd, rawfastqsdf$Filepaths[x], rawfastqsdf$NewFullFN[x], collapse = " ") } )
-
-if (opt$simulate){
-    flog.info("This is a simulation. Commands for renaming when not simulating are:")
-    print(rencommands)
-} else {
-    for (cmd in rencommands){
-        flog.info(paste("Renaming with command", cmd))
-        system(cmd)
+NOGO <- NULL
+#Loop through prefixes and act accordingly.
+for (currPrefix in JAMSalphaorigindf$Prefix){
+    currbankcmds <- NULL
+    abortprefix <- FALSE
+    sampledf <- subset(JAMSalphaorigindf, Prefix == currPrefix)
+    #Bank jams, report and tarball file
+    for (jf in c("JAMSfile", "Report", "JAMStarball")){
+        target <- switch(jf, "JAMSfile" = opt$jamsfiles, "Report" = opt$reports, "JAMStarball" = opt$JAMStarballs)
+        if(file.exists(file.path(opt$origin, sampledf[, jf]))){
+            #Check if file with same name has already been banked.
+            if (file.exists(file.path(target, sampledf[, jf]))){
+                report2log(message = paste("Target file", (file.path(target, sampledf[, jf])), "already exists." ), warn = TRUE, opt = opt)
+                abortprefix <- TRUE
+            } else {
+                currbankcmds <- append(paste(manipcmd, (file.path(opt$origin, sampledf[, jf])), (file.path(target, sampledf[, jf]))), currbankcmds)
+                if (!is.null(opt$chmod)){
+                    currbankcmds <- append(paste("chmod", as.character(opt$chmod), file.path(target, sampledf[, jf])), currbankcmds)
+                }
+            }
+        } else {
+            report2log(message = paste("Could not find", sampledf[, jf]), warn = TRUE, opt = opt)
+            abortprefix <- TRUE
+        }
+    }
+    #Bank reads
+    if (opt$ignorereads != TRUE){
+        readsfilenames <- paste(paste(sampledf$Prefix, c("Microbiota", "QCtrimmed"), "reads", sep="_"), "tar", "gz", sep=".")
+        readsfilenameswithpaths <- file.path(opt$origin, readsfilenames)
+        if (any(file.exists(readsfilenameswithpaths))){
+            currreadsfile <- readsfilenameswithpaths[which(file.exists(readsfilenameswithpaths) == TRUE)][1]
+            currreadsfilename <- readsfilenames[which(file.exists(readsfilenameswithpaths) == TRUE)][1]
+            destreadsfn <- file.path(opt$destination, currreadsfilename)
+            if (!file.exists(destreadsfn)){
+                currbankcmds <- append(paste(manipcmd, currreadsfile, destreadsfn), currbankcmds)
+                if (!is.null(opt$chmod)){
+                    currbankcmds <- append(paste("chmod", as.character(opt$chmod), destreadsfn), currbankcmds)
+                }
+            }
+        } else {
+            report2log(message = paste("Unable to find any reads for sample", currPrefix))
+        }
+    } else {
+        report2log(message = paste("Omitting banking of reads for sample", currPrefix, "as requested."))
+    }
+    if (abortprefix != TRUE){
+        report2log(message = paste("Sample", currPrefix, "is GO for banking."), opt = opt)
+        for (cmd in rev(currbankcmds)){
+            if (opt$simulate != TRUE){
+                #Actually execute the commands
+                report2log(message = paste("Executing:", cmd), opt = opt)
+                system(cmd)
+            } else {
+                #Show what would be done
+                report2log(message = paste("Simulating:", cmd), opt = opt)
+            }
+        }
+    } else {
+        report2log(message = paste("Sample", currPrefix, "is NO-GO for banking."), opt = opt)
+        NOGO <- append(NOGO, currPrefix)
     }
 }
 
-save.image(opt$projimage)
+if (length(NOGO) > 0){
+    report2log(message = paste("Samples", paste0(NOGO, collapse = ", "), "were NO-GO for banking, and thus skipped."), opt = opt)
+} else {
+    report2log(message = "All requested JAMSalpha prefixes were banked.", opt = opt)
+}
