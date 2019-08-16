@@ -172,7 +172,7 @@ option_list <- list(
     make_option(c("-m", "--move"), default = defopt$move, action="store_true",
                 help = str_c("Copy to destination rather than move. Default is to move.")),
 
-    make_option(c("-m", "--chmod"), default = NULL, action="store",
+    make_option(c("-c", "--chmod"), default = NULL, action="store",
                 help = str_c("Change permissions of banked files to this. Example: 755 or ug+rwx")),
 
     make_option(c("-x", "--deleteJAMSfolder"), default = FALSE,
