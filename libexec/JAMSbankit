@@ -343,7 +343,7 @@ for (currPrefix in JAMSalphaorigindf$Prefix){
     #Delte project folder if requested
     if (opt$deleteJAMSfolder == TRUE){
         currprojfolder <- file.path(opt$origin, paste(currPrefix, "JAMS", sep = "_"))
-        currbankcmds <- append(paste("rm -r", currprojfolder), currbankcmds)
+        currbankcmds <- append(paste("rm -rf", currprojfolder), currbankcmds)
     }
     if (abortprefix != TRUE){
         report2log(message = paste("Sample", currPrefix, "is GO for banking."), opt = opt)
