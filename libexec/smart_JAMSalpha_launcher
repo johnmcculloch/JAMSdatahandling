@@ -1,0 +1,256 @@
+#!/usr/bin/env Rscript
+suppressWarnings(suppressPackageStartupMessages(library(optparse)))
+suppressWarnings(suppressPackageStartupMessages(library(futile.logger)))
+suppressWarnings(suppressPackageStartupMessages(library(benchmarkme)))
+suppressWarnings(suppressPackageStartupMessages(library(tidyverse)))
+suppressWarnings(suppressPackageStartupMessages(library(RCurl)))
+suppressWarnings(suppressPackageStartupMessages(library(parallel)))
+suppressWarnings(suppressPackageStartupMessages(library(openxlsx)))
+
+#####################################
+# Define System-specific Functions ##
+#####################################
+if ((.Platform$OS.type) != "unix"){
+    stop("This script only works on UNIX. Install Linux and try again.")
+}
+
+#Decide which kind of system you are on.
+detectHardwareResources <- function(){
+    #First off, detect if on Slurm type cluster
+    #Get slurm job ID
+    currslurmjobid <- as.character(Sys.getenv("SLURM_JOB_ID"))
+
+    if(nchar(currslurmjobid) < 3){
+       #Define appropriate functions for non-slurm system
+       detectBatchCPUs <- function() {
+            ncores <- detectCores()
+            if (is.na(ncores)) {
+                stop("Could not determine how many CPUs you have. Aborting.")
+            }
+            return(ncores)
+        }
+
+        detectAvailRAM <- function(){
+            totmembytes<-as.numeric(get_ram())
+
+            return(totmembytes)
+        }
+
+    } else {
+        #Define appropriate functions for slurm system
+        detectBatchCPUs <- function() {
+            slurmjobid <- as.character(Sys.getenv("SLURM_JOB_ID"))
+            ncores <- as.numeric(Sys.getenv("SLURM_CPUS_PER_TASK"))
+
+            if (is.na(ncores)) {
+                #Try plan B
+                sacctraw <- system2("sacct", args = c("-j", slurmjobid, "-X", "-P"), stdout = TRUE)
+                jobinforaw <- sacctraw[2]
+                jobinfoheaders <- sacctraw[1]
+                jobinfo <- unlist(strsplit(jobinforaw, split="\\|"))
+                names(jobinfo) <- unlist(strsplit(jobinfoheaders, split="\\|"))
+                ncores <- as.integer(jobinfo["AllocCPUS"])
+                print(jobinfo)
+                if (is.na(ncores)) {
+                    stop("Could not determine how many CPUs you have. Aborting.")
+                }
+            }
+
+            return(ncores)
+        }
+
+        detectAvailRAM <- function(){
+            mempercpu <- as.integer(Sys.getenv("SLURM_MEM_PER_CPU"))
+            mempernode <- as.integer(Sys.getenv("SLURM_MEM_PER_NODE"))
+            cpuspertask <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK"))
+
+            if(!(is.na(mempernode))){
+                totmem <- mempernode
+            } else {
+                totmem <- mempercpu * cpuspertask
+            }
+
+            totmembytes <- totmem * 1000000
+
+            return(totmembytes)
+        }
+    }
+    hardwareRes <- NULL
+    hardwareRes[1] <- detectBatchCPUs()
+    hardwareRes[2] <- detectAvailRAM()
+    names(hardwareRes) <- c("threads", "memory")
+
+    return(hardwareRes)
+}
+
+############################
+## Define other functions ##
+############################
+filetype <- function(path){
+    f = file(path)
+    ext = summary(f)$class
+    close.connection(f)
+    ext
+}
+
+# get path of running script
+getScriptPath <- function() {
+    cmdArgs <- commandArgs(trailingOnly = FALSE)
+    needle <- "--file="
+    match <- grep(needle, cmdArgs)
+    if (length(match) > 0) {
+        return(dirname(normalizePath(sub(needle, "", cmdArgs[match]))))
+    } else {
+        return(dirname(normalizePath(sys.frames()[[1]]$ofile)))
+    }
+}
+
+#########################
+# Get options from args #
+#########################
+#Define defaults
+defopt <- list()
+defopt$verstr <- paste0("smart_JAMSalpha_launcher v", "1.0")
+defopt$metadata <- NULL
+defopt$reads_origin_folder <- NULL
+defopt$output_folder <- getwd()
+defopt$JAMSarchive_folder <- NULL
+defopt$JAMSdb <- "/data/Trinchieri_lab/JAMSdb/JAMSdbApr2020_96Gbk2db"
+defopt$host_species <- "human"
+defopt$simulate <- FALSE
+defopt$threads <- as.numeric(detectHardwareResources()["threads"])
+
+option_list <- list(
+    make_option(c("-x", "--metadata"), default = defopt$metadata, action="store",
+                help = str_c("Metadata in xlsx format. Must contain a column named \'Sample\' with fastq prefixes. If a column named \'OriPrefix\' is present, original fastq files will be copy-renamed to the name in the \'Sample\' column and that will be used as prefix for JAMSalpha (default: ", defopt$metadata, ")")),
+
+    make_option(c("-r", "--reads_origin_folder"), default = defopt$reads_origin_folder, action="store",
+                help = str_c("Folder containing fastq files to use as input for JAMSalpha. Fastq files will be searched for recursively downstream of this folder for prefixes matching those specified in the metadata, either in the \'Sample\' column or the \'OriPrefix\' column. (default: ", defopt$reads_origin_folder, ")")),
+
+    make_option(c("-o", "--output_folder"), default = defopt$output_folder, action="store",
+                help = str_c("Output folder for JAMSalpha runs before banking. (default: ", defopt$output_folder, ")")),
+
+    make_option(c("-a", "--JAMSarchive_folder"), default = defopt$JAMSarchive_folder, action="store",
+                help = str_c("Optional. If a folder with archived JAMS files is passed, will check if prefixes in metadata have already been used. Used prefixes will be omitted and a warning will be issued. (default: ", defopt$JAMSarchive_folder, ")")),
+
+    make_option(c("-d", "--JAMSdb"), default = defopt$JAMSdb, action="store",
+                help = str_c("Folder with JAMSdb to be used. (default: ", defopt$JAMSdb, ")")),
+
+    make_option(c("-H", "--host_species"), default = defopt$host_species, action="store",
+                help = str_c("Host species for JAMSalpha run. (default: ", defopt$host_species, ")")),
+
+    make_option(c("-s", "--simulate"), default = defopt$simulate, action="store_true",
+                help = str_c("Simulate and print commands for launching [and renaming], do not actually execute any command.")),
+
+    make_option(c("-v", "--version"), action="store_true",
+                help ="report version")
+)
+
+# parse the options
+args <- commandArgs(trailingOnly = TRUE)
+opt <- parse_args(OptionParser(option_list = option_list), args)
+opt <- merge.list(opt, defopt)
+
+#####################
+## Set environment ##
+#####################
+
+# print version & exit if -v
+if (!is.null(opt$version)) {
+    print(opt$verstr)
+    quit()
+}
+
+#Get Script path
+opt$bindir <- getScriptPath()
+
+#Fix path relativity
+fixrelpath <- function(JAMSpath = NULL){
+    require(R.utils)
+    if (!(isAbsolutePath(JAMSpath))){
+        fixedpath <- getAbsolutePath(JAMSpath)
+    } else {
+        fixedpath <- JAMSpath
+    }
+
+    return(fixedpath)
+}
+
+for (pathtofix in c("metadata", "reads_origin_folder", "output_folder", "JAMSarchive_folder", "JAMSdb")){
+    if (!is.null(opt[[pathtofix]])){
+        opt[[pathtofix]] <- fixrelpath(opt[[pathtofix]])
+    }
+}
+
+# give help if needed input option not provided
+if (is.null(opt$reads_origin_folder)) {
+    print("You must supply a folder with reads to rename.")
+    parse_args(OptionParser(option_list = option_list), c("-h"))
+    q()
+}
+
+
+#Define useful functions
+is.redundant <- function(vec){
+    propunique <- length(unique(vec))/length(vec)
+    if (propunique < 1){
+        redundant = TRUE
+    } else {
+        redundant = FALSE
+    }
+
+    return(redundant)
+}
+
+###################
+## Main Function ##
+###################
+library(JAMS)
+setwd(opt$output_folder)
+opt$projimage <- file.path(opt$output_folder, ".RData")
+save.image(opt$projimage)
+
+#Analyse metadata
+pheno <- read.xlsx(opt$metadata)
+
+#Check for validity of metadata
+if (!("Sample" %in% colnames(pheno))){
+    stop("Metadata must contain a column named \'Sample\' for finding fastqs and attributing prefixes. Check your metadata ant try again.")
+}
+
+#Rename reads if appropriate
+if ("OriPrefix" %in% colnames(pheno)){
+    flog.info("Fastq prefixes will be renamed from the \'OriPrefix\' column to the \'Sample\' column.")
+    #make a sub.map for JAMSprefixrenamer to use.
+    submap <- pheno[ , c("OriPrefix", "Sample")]
+    write.table(submap, file = "pref_sub.map", sep = "\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+    #Copy-rename files using JAMSprefixrenamer
+    opt$fastq_destination <- file.path(opt$output_folder, "rawreadsSafePrefixes")
+    renamecmd <- paste("JAMSfastqprefixrenamer", "-r", opt$reads_origin_folder, "-t", "pref_sub.map", "-d", opt$fastq_destination, collapse = " ")
+    if (opt$simulate){
+        renamecmd <- paste(renamecmd, "-s", collapse = " ")
+    }
+    if (!is.null(opt$JAMSarchive_folder)){
+        renamecmd <- paste(renamecmd, "-c", opt$JAMSarchive_folder, collapse = " ")
+    }
+    system(renamecmd)
+} else {
+    opt$fastq_destination <- opt$reads_origin_folder
+}
+
+save.image(opt$projimage)
+
+#Save prefix list for making swarm
+cat(as.character(pheno$Sample), file = "pref.list", sep = "\n")
+#Make swarm
+flog.info("Making swarm")
+swarmcmd <- paste("JAMSmakeswarm", "--readsfolder", opt$fastq_destination, "--outputfolder", opt$output_folder, "--hostspecies", opt$host_species, "--jamsdb", opt$JAMSdb, "--prefixlist", "pref.list", "-q", collapse = " ")
+system(swarmcmd)
+
+if (!opt$simulate){
+    JAMSalphajob <- system2("swarm", args = c("-g", "230", "-t", "52", "--time=22:00:00", "--maxrunning=15", "--partition=norm,ccr", "-f", "JAMS.swarm"))
+    flog.info(paste("JAMSalpha swarm launched under Job ID number", JAMSalphajob))
+} else {
+    flog.info("Run the following command to launch JAMSalpha swarm:")
+    cat(paste("swarm", "-g", "230", "-t", "52", "--time=22:00:00", "--maxrunning=15", "--partition=norm,ccr", "-f", "JAMS.swarm", collapse = " "))
+}
